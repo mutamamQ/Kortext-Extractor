@@ -65,13 +65,15 @@
     return quietly(() => new URL(String(value), location.href).href) || String(value || "");
   }
 
-  // Content base: https://host/api/content/v1/epub/epub-page/<id>/EPUB/
+  // Book root: https://host/api/content/v1/epub/epub-page/<id>/ (files keep OEBPS/, EPUB/...)
   function contentBase() {
     for (const entry of window.__ktxCapture.values()) {
-      const m = quietly(() => entry.url.match(/^(.*\/api\/content\/v1\/epub\/[^/]+\/[^/]+\/EPUB\/)/));
-      if (m) return m[1];
+      const url = quietly(() => new URL(entry.url));
+      const m = url && url.pathname.match(/^(.*\/api\/content\/v1\/epub\/[^/]+\/[^/]+\/)[^/]+\/./);
+      if (m) return url.origin + m[1];
     }
-    return null;
+    const id = (location.pathname.match(/\/reader\/epub\/(\d+)/) || [])[1];
+    return id ? `${location.origin}/api/content/v1/epub/epub-page/${id}/` : null;
   }
 
   function internalPathOf(url, base) {
@@ -116,7 +118,10 @@
 
   async function fetchResource(url) {
     try {
-      const response = await window.fetch(url, { credentials: "include" });
+      const response = await (window.__ktxNativeFetch || window.fetch)(url, {
+        credentials: "include",
+        headers: window.__ktxAuthHeaders || {} // reader's Bearer + x-drm-* (chapters 401 otherwise)
+      });
       if (!response.ok) return null;
       const bytes = copyBytes(await response.arrayBuffer());
       return bytes && bytes.byteLength ? bytes : null;
@@ -172,15 +177,31 @@
       if (!files.has(internal)) files.set(internal, entry.bytes.slice(0));
     }
 
-    // Spine order from the real package document if available.
-    let opf = files.get("package.opf");
-    if (!opf) {
-      const bytes = await fetchResource(`${base}package.opf`);
-      if (bytes) {
-        files.set("package.opf", bytes);
+    // Spine order from the real package document if available
+    // (container.xml points at it, e.g. OEBPS/content.opf).
+    const get = async (path) => {
+      if (files.has(path)) return files.get(path);
+      const bytes = await fetchResource(base + path.split("/").map(encodeURIComponent).join("/"));
+      if (bytes) files.set(path, bytes);
+      return bytes;
+    };
+    const container = await get("META-INF/container.xml");
+    const fromContainer = container &&
+      (decodeText(container).match(/<rootfile\b[^>]*\bfull-path\s*=\s*["']([^"']+)["']/i) || [])[1];
+    const dirs = new Set(Array.from(files.keys()).map((p) => p.split("/")[0] + "/").filter((d) => d !== "META-INF/"));
+    const candidates = [fromContainer, ...[...dirs, "OEBPS/", "EPUB/", ""].flatMap((d) =>
+      [`${d}content.opf`, `${d}package.opf`])].filter(Boolean);
+    let opf = null;
+    files.opfPath = null;
+    for (const path of new Set(candidates)) {
+      const bytes = await get(path);
+      if (bytes && /<package\b/i.test(decodeText(bytes).slice(0, 4096))) {
         opf = bytes;
-        log("using the server's package document for spine order");
+        files.opfPath = path;
+        log("using the server's package document for spine order:", path);
+        break;
       }
+      if (bytes && path !== fromContainer) files.delete(path);
     }
 
     if (opf) {
@@ -188,7 +209,7 @@
       let m;
       const ITEM_HREF = /<item[^>]*\bhref\s*=\s*["']([^"']+)["']/gi;
       while ((m = ITEM_HREF.exec(text))) {
-        const internal = resolveInternal("package.opf", m[1]);
+        const internal = resolveInternal(files.opfPath, m[1]);
         if (internal) enqueue(internal);
       }
     }
@@ -199,26 +220,24 @@
       for (const ref of collectRefs(path, decodeText(bytes))) enqueue(ref);
     }
 
-    while (queue.length) {
-      const batch = queue.splice(0, 8);
-      const results = await Promise.all(batch.map(async (internalPath) => {
-        if (files.has(internalPath)) return files.get(internalPath);
+    // worker pool: keep CONCURRENCY fetches in flight for speed
+    const CONCURRENCY = 24;
+    async function worker() {
+      while (queue.length) {
+        const internalPath = queue.shift();
+        if (files.has(internalPath)) continue;
         const bytes = await fetchResource(base + internalPath.split("/").map(encodeURIComponent).join("/"));
-        if (!bytes) return null;
+        if (!bytes) continue;
         fetchedCount += 1;
         files.set(internalPath, bytes);
-        return bytes;
-      }));
-      for (let i = 0; i < batch.length; i += 1) {
-        const file = results[i];
-        if (!file) continue;
-        const path = batch[i];
-        if (!/\.(xhtml|html|htm|css|opf|ncx|svg)$/i.test(path)) continue;
-        for (const ref of collectRefs(path, decodeText(file))) enqueue(ref);
+        if (/\.(xhtml|html|htm|css|opf|ncx|svg)$/i.test(internalPath)) {
+          for (const ref of collectRefs(internalPath, decodeText(bytes))) enqueue(ref);
+        }
+        if (fetchedCount % 100 === 0) log(`harvesting... ${files.size} resources so far`);
       }
-      if (fetchedCount && fetchedCount % 50 === 0) {
-        log(`harvesting... ${files.size} resources so far`);
-      }
+    }
+    while (queue.length) {
+      await Promise.all(Array.from({ length: CONCURRENCY }, worker));
     }
 
     log(`harvest complete: ${files.size} resources (${fetchedCount} fetched directly)`);
@@ -227,7 +246,7 @@
 
   // Spine order from the package document (or natural sort fallback).
   function spineOrder(files) {
-    const opf = files.get("package.opf");
+    const opf = files.opfPath && files.get(files.opfPath);
     if (opf) {
       const text = decodeText(opf);
       const order = [];
@@ -242,7 +261,7 @@
       }
       while ((m = ITEMREF.exec(text))) {
         const href = idToHref.get(m[1]);
-        const internal = href && resolveInternal("package.opf", href);
+        const internal = href && resolveInternal(files.opfPath, href);
         if (internal && files.has(internal)) order.push(internal);
       }
       if (order.length) return order;
@@ -349,7 +368,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>${(document.title || "book").replace(/</g, "&lt;")}</title>
+<title>${((files.opfPath && (decodeText(files.get(files.opfPath)).match(/<dc:title[^>]*>([^<]{1,200})<\/dc:title>/i) || [])[1]) || document.title || "book").replace(/</g, "&lt;")}</title>
 <style>
   @page { size: A4; margin: 18mm 15mm; }
   body { font-family: Georgia, "Times New Roman", serif; }

@@ -9,16 +9,16 @@
    * Call window.__ktxExport() whenever you like — the export itself will
    * HARVEST the rest of the book directly from the content API:
    *
-   *  1. It looks for the real EPUB package document
-   *     (/api/content/v1/epub/epub-page/<id>/EPUB/package.opf). If the
-   *     server serves it, the full manifest + spine is used verbatim.
+   *  1. It reads META-INF/container.xml to find the real package document
+   *     (e.g. .../epub-page/<id>/OEBPS/content.opf). If the server serves
+   *     it, the full manifest + spine is used verbatim.
    *  2. Otherwise it parses every captured chapter for src/href/url()
    *     references (images, CSS, fonts, linked chapters, TOC entries),
    *     resolves them against the content API base URL, and fetches them.
    *  3. Images and other subresources never go through fetch()/XHR while
    *     reading (they are plain <img> loads), so they are fetched at export.
-   *  4. The archive keeps the original EPUB/ directory layout so all
-   *     relative links keep working.
+   *  4. The archive keeps the server's directory layout (OEBPS/, EPUB/, ...)
+   *     so all relative links keep working.
    */
 
   const TAG = "[ktx]";
@@ -48,6 +48,26 @@
 
   let captureSequence = 0;
   let exporting = false;
+  // auth headers the reader sends to the content API (Bearer + x-drm-*);
+  // chapter XHTMLs 401 without them, so the export replays these on every fetch.
+  const authHeaders = (window.__ktxAuthHeaders instanceof Object) ? window.__ktxAuthHeaders : {};
+  window.__ktxAuthHeaders = authHeaders;
+
+  const AUTH_HEADER = /^(authorization|x-drm-|x-sessionid|x-client-sessionid|x-requested-with)/i;
+
+  function rememberHeaders(args, request) {
+    quietly(() => {
+      const grab = (h) => {
+        if (!h) return;
+        const take = (k, v) => { if (k && v != null && AUTH_HEADER.test(k)) authHeaders[k.toLowerCase()] = String(v); };
+        if (typeof h.forEach === "function" && !Array.isArray(h)) h.forEach((v, k) => take(k, v)); // Headers
+        else if (Array.isArray(h)) for (const [k, v] of h) take(k, v);
+        else for (const k of Object.keys(h)) take(k, h[k]);
+      };
+      if (request && request.headers) grab(request.headers);   // Request object
+      if (args && args[1] && args[1].headers) grab(args[1].headers); // init.headers
+    });
+  }
 
   const NOISE_URL = new RegExp(
     "applicationinsights|google-analytics|googletagmanager" +
@@ -113,8 +133,13 @@
         const method = quietly(() => (args[1] && args[1].method) ||
           (request && request.method) || "GET") || "GET";
         const url = absoluteUrl(quietly(() => (request && request.url) || request) || "");
-        const sameOrigin = quietly(() => new URL(url, location.href).origin === location.origin) || false;
+        const sameOrigin = /^https?:/i.test(url) &&
+          (quietly(() => new URL(url, location.href).origin === location.origin) || false);
         const trackable = sameOrigin && String(method).toUpperCase() === "GET" && !isNoise(url);
+
+        // Remember the auth headers the reader sends to the content API, so the
+        // export can replay them (chapters need Bearer + x-drm-*; 401 otherwise).
+        if (sameOrigin && /\/api\/content\//.test(url)) rememberHeaders(args, request);
 
         const response = await originalFetch.apply(this, args);
 
@@ -137,6 +162,36 @@
 
   function hookWindow(win) {
     hookFetch(win, win === window ? "top" : "iframe");
+    hookXhrHeaders(win);
+  }
+
+  // unhooked fetch for the harvest, so exported files aren't copied into the
+  // capture map a second time (halves memory on big books)
+  const nativeFetch = window.fetch.bind(window);
+  window.__ktxNativeFetch = nativeFetch; // reused by kortext-extract-pdf.js
+
+  // Angular's HttpClient sends the Bearer/x-drm-* headers over XHR, so
+  // record them from setRequestHeader as well.
+  function hookXhrHeaders(win) {
+    quietly(() => {
+      const proto = win.XMLHttpRequest && win.XMLHttpRequest.prototype;
+      if (!proto || proto.setRequestHeader.__ktxHooked) return;
+      const originalOpen = proto.open;
+      const originalSet = proto.setRequestHeader;
+      proto.open = function ktxOpen(method, url, ...rest) {
+        quietly(() => { this.__ktxUrl = absoluteUrl(url); });
+        return originalOpen.call(this, method, url, ...rest);
+      };
+      proto.setRequestHeader = function ktxSetRequestHeader(name, value) {
+        quietly(() => {
+          if (/\/api\/content\//.test(this.__ktxUrl || "") && AUTH_HEADER.test(name)) {
+            authHeaders[String(name).toLowerCase()] = String(value);
+          }
+        });
+        return originalSet.call(this, name, value);
+      };
+      proto.setRequestHeader.__ktxHooked = true;
+    });
   }
 
   hookWindow(window);
@@ -168,25 +223,29 @@
     return quietly(() => new TextDecoder("utf-8").decode(bytes)) || "";
   }
 
-  // Find the content API base from captured URLs:
-  //   https://host/api/content/v1/epub/epub-page/<id>/EPUB/content/x.xhtml
-  //   -> https://host/api/content/v1/epub/epub-page/<id>/EPUB/
+  // Find the book root from captured URLs:
+  //   https://host/api/content/v1/epub/epub-page/<id>/OEBPS/x.xhtml
+  //   -> https://host/api/content/v1/epub/epub-page/<id>/
+  // Files are kept relative to this root (OEBPS/..., EPUB/..., META-INF/...).
   function contentBase() {
     for (const entry of capture.values()) {
-      const m = quietly(() => entry.url.match(/^(.*\/api\/content\/v1\/epub\/[^/]+\/[^/]+\/EPUB\/)/));
-      if (m) return m[1];
+      const url = quietly(() => new URL(entry.url));
+      const m = url && url.pathname.match(/^(.*\/api\/content\/v1\/epub\/[^/]+\/[^/]+\/)[^/]+\/./);
+      if (m) return url.origin + m[1];
     }
-    return null;
+    // nothing captured yet (chapter came from cache): derive it from /reader/epub/<id>
+    const id = (location.pathname.match(/\/reader\/epub\/(\d+)/) || [])[1];
+    return id ? `${location.origin}/api/content/v1/epub/epub-page/${id}/` : null;
   }
 
-  // Internal path of a captured URL relative to EPUB/
-  //   .../EPUB/content/1.0.xhtml -> content/1.0.xhtml
+  // Internal path of a captured URL relative to the book root
+  //   .../<id>/OEBPS/Title_page.xhtml -> OEBPS/Title_page.xhtml
   function internalPathOf(url, base) {
     return quietly(() => decodeURIComponent(new URL(url).pathname)
       .slice(new URL(base).pathname.length)) || null;
   }
 
-  // Resolve a relative reference from an internal path, staying inside EPUB/.
+  // Resolve a relative reference from an internal path, staying inside the book.
   function resolveInternal(fromPath, ref) {
     ref = String(ref || "").trim();
     if (!ref || /^(https?:|data:|blob:|mailto:|tel:|#)/i.test(ref)) return null;
@@ -359,7 +418,10 @@
 
   async function fetchResource(url) {
     try {
-      const response = await window.fetch(url, { credentials: "include" });
+      const response = await nativeFetch(url, {
+        credentials: "include",
+        headers: authHeaders // replay the reader's Bearer + x-drm-* (chapters 401 otherwise)
+      });
       if (!response.ok) return null;
       const bytes = copyBytes(await response.arrayBuffer());
       return bytes && bytes.byteLength ? bytes : null;
@@ -394,6 +456,29 @@
     return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
   }
 
+  // Returns the package document's internal path (e.g. OEBPS/content.opf) or null.
+  async function findPackageDocument(base, files, store) {
+    const get = async (path) => {
+      if (files.has(path)) return files.get(path).bytes;
+      const bytes = await fetchResource(base + path.split("/").map(encodeURIComponent).join("/"));
+      if (bytes) store(path, bytes);
+      return bytes;
+    };
+    const container = await get("META-INF/container.xml");
+    const fromContainer = container &&
+      (decodeText(container).match(/<rootfile\b[^>]*\bfull-path\s*=\s*["']([^"']+)["']/i) || [])[1];
+    // folders the captured chapters live in, e.g. OEBPS/ or EPUB/
+    const dirs = new Set(Array.from(files.keys()).map((p) => p.split("/")[0] + "/").filter((d) => d !== "META-INF/"));
+    const candidates = [fromContainer, ...[...dirs, "OEBPS/", "EPUB/", ""].flatMap((d) =>
+      [`${d}content.opf`, `${d}package.opf`])].filter(Boolean);
+    for (const path of new Set(candidates)) {
+      const bytes = await get(path);
+      if (bytes && /<package\b/i.test(decodeText(bytes).slice(0, 4096))) return path;
+      if (bytes && path !== fromContainer) files.delete(path);
+    }
+    return null;
+  }
+
   async function harvest(base) {
     const files = new Map(); // internal path -> { path, bytes }
     const queue = [];
@@ -421,28 +506,24 @@
       store(internal, entry.bytes);
     }
 
-    // 1) Try the real package document first.
-    const opfUrl = `${base}package.opf`;
-    let opf = quietly(() => files.get("package.opf"));
-    if (!opf) {
-      log("probing for the real package document:", opfUrl);
-      const bytes = await fetchResource(opfUrl);
-      if (bytes) {
-        store("package.opf", bytes);
-        opf = files.get("package.opf");
-        log("package document retrieved from the server; using its manifest");
-      }
-    }
-
+    // 1) Find the real package document: container.xml points at it, else
+    //    try the usual locations (Kortext has served both OEBPS/ and EPUB/).
+    let opfPath = await findPackageDocument(base, files, store);
+    const opf = opfPath && files.get(opfPath);
     if (opf) {
+      log("package document:", opfPath, "- using its manifest");
       const text = decodeText(opf.bytes);
       let m;
       const ITEM_HREF = /<(?:manifest:)?item[^>]*\bhref\s*=\s*["']([^"']+)["']/gi;
       while ((m = ITEM_HREF.exec(text))) {
-        const internal = resolveInternal("package.opf", m[1]);
+        const internal = resolveInternal(opfPath, m[1]);
         if (internal) enqueue(internal);
       }
+    } else {
+      opfPath = null;
+      log("no package document found on the server; crawling links instead");
     }
+    files.opfPath = opfPath;
 
     // Captured chapters are already in `files`, so enqueue() skips them; follow
     // their references here or nothing gets crawled when there is no package.opf.
@@ -451,28 +532,26 @@
       for (const ref of collectRefs(file.path, decodeText(file.bytes))) enqueue(ref);
     }
 
-    // 2) Crawl: process queue of internal paths, fetching missing ones and
-    //    following references recursively (images, css, fonts, chapters, TOC).
-    while (queue.length) {
-      const batch = queue.splice(0, 8);
-      const results = await Promise.all(batch.map(async (internalPath) => {
-        if (files.has(internalPath)) return files.get(internalPath);
+    // 2) Crawl with a worker pool: keep CONCURRENCY fetches in flight at all
+    //    times and follow references recursively (images, css, chapters, TOC).
+    const CONCURRENCY = 24;
+    async function worker() {
+      while (queue.length) {
+        const internalPath = queue.shift();
+        if (files.has(internalPath)) continue;
         const bytes = await fetchResource(base + internalPath.split("/").map(encodeURIComponent).join("/"));
-        if (!bytes) return null; // stays in `queued` so a 404 isn't retried for every page that links it
+        if (!bytes) continue; // stays in `queued` so a 404 isn't retried for every page that links it
         fetchedCount += 1;
         store(internalPath, bytes);
-        return files.get(internalPath);
-      }));
-      for (const file of results) {
-        if (!file) continue;
-        const isText = /\.(xhtml|html|htm|css|opf|ncx|svg)$/i.test(file.path);
-        if (!isText) continue;
-        const text = decodeText(file.bytes);
-        for (const ref of collectRefs(file.path, text)) enqueue(ref);
+        if (/\.(xhtml|html|htm|css|opf|ncx|svg)$/i.test(internalPath)) {
+          for (const ref of collectRefs(internalPath, decodeText(bytes))) enqueue(ref);
+        }
+        if (fetchedCount % 100 === 0) log(`harvesting... ${files.size} resources so far`);
       }
-      if (fetchedCount && fetchedCount % 50 === 0) {
-        log(`harvesting... ${files.size} resources so far`);
-      }
+    }
+    // workers refill from enqueue() as they discover links, so loop until drained
+    while (queue.length) {
+      await Promise.all(Array.from({ length: CONCURRENCY }, worker));
     }
 
     log(`harvest complete: ${files.size} resources (${fetchedCount} fetched directly)`);
@@ -541,7 +620,7 @@ ${spine.join("\n")}
       // PDF books: a single PDF resource in captures -> direct download.
       // Checked before contentBase(), which only matches EPUB URLs.
       const pdfs = all.filter((entry) => startsWithPdf(entry.bytes));
-      if (pdfs.length === 1 && !all.some((entry) => /\/EPUB\//.test(entry.url))) {
+      if (pdfs.length === 1 && !all.some((entry) => /\/epub-page\//.test(entry.url))) {
         const blob = new Blob([pdfs[0].bytes], { type: "application/pdf" });
         download(blob, `${safeTitle()}.pdf`);
         log("exported one complete PDF", `(${pdfs[0].bytes.byteLength} bytes)`);
@@ -554,6 +633,9 @@ ${spine.join("\n")}
         return null;
       }
       log("content base:", base);
+      if (!authHeaders.authorization) {
+        log("warning: no reader auth headers seen yet — turn a page first or chapters may 401");
+      }
 
       const files = await harvest(base);
       if (!files.size) {
@@ -561,24 +643,30 @@ ${spine.join("\n")}
         return null;
       }
 
-      const title = titleFromChapters(files) || safeTitle();
+      const opfTitle = files.opfPath && files.get(files.opfPath) &&
+        (decodeText(files.get(files.opfPath).bytes).match(/<dc:title[^>]*>([^<]{1,200})<\/dc:title>/i) || [])[1];
+      const title = (opfTitle && opfTitle.trim().replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_").slice(0, 120)) ||
+        titleFromChapters(files) || safeTitle();
 
+      // keep the server's package document at its real path (e.g. OEBPS/content.opf)
+      // so its relative hrefs still work; otherwise synthesize package.opf at the root
+      const opfPath = files.opfPath || "package.opf";
       const zipFiles = [
         { name: "mimetype", bytes: encoder.encode("application/epub+zip") },
         {
           name: "META-INF/container.xml",
           bytes: encoder.encode(
-            `<?xml version="1.0" encoding="UTF-8"?>\n<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">\n  <rootfiles>\n    <rootfile full-path="package.opf" media-type="application/oebps-package+xml"/>\n  </rootfiles>\n</container>\n`
+            `<?xml version="1.0" encoding="UTF-8"?>\n<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">\n  <rootfiles>\n    <rootfile full-path="${xmlEscape(opfPath)}" media-type="application/oebps-package+xml"/>\n  </rootfiles>\n</container>\n`
           )
         }
       ];
       for (const file of files.values()) {
-        if (file.path === "package.opf" || /^META-INF\//i.test(file.path)) continue;
+        if (file.path === opfPath || /^META-INF\//i.test(file.path)) continue;
         zipFiles.push({ name: file.path, bytes: file.bytes });
       }
-      const realOpf = files.get("package.opf");
+      const realOpf = files.opfPath && files.get(files.opfPath);
       zipFiles.push({
-        name: "package.opf",
+        name: opfPath,
         bytes: realOpf ? realOpf.bytes : encoder.encode(synthesizePackageDocument(files, title))
       });
       if (!realOpf) log("no package document on the server; synthesized one (spine in natural file order)");
