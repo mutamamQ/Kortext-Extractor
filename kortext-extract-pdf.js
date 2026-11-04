@@ -82,7 +82,8 @@
   function resolveInternal(fromPath, ref) {
     ref = String(ref || "").trim();
     if (!ref || /^(https?:|data:|blob:|mailto:|tel:|#)/i.test(ref)) return null;
-    const refPath = ref.split("#")[0].split("?")[0];
+    const rawPath = ref.split("#")[0].split("?")[0];
+    const refPath = quietly(() => decodeURIComponent(rawPath)) || rawPath;
     if (!refPath) return null;
     const stack = fromPath.split("/");
     stack.pop();
@@ -130,11 +131,13 @@
   function collectRefs(path, text) {
     const refs = [];
     let m;
+    REF_ATTR.lastIndex = 0;
     while ((m = REF_ATTR.exec(text))) {
       const internal = resolveInternal(path, m[1]);
       if (internal) refs.push(internal);
     }
     if (/\.css$/i.test(path)) {
+      CSS_URL.lastIndex = 0;
       while ((m = CSS_URL.exec(text))) {
         const internal = resolveInternal(path, m[1]);
         if (internal) refs.push(internal);
@@ -190,6 +193,12 @@
       }
     }
 
+    // captured chapters are already in `files`, so follow their refs up front
+    for (const [path, bytes] of Array.from(files)) {
+      if (!/\.(xhtml|html|htm|css|opf|ncx|svg)$/i.test(path)) continue;
+      for (const ref of collectRefs(path, decodeText(bytes))) enqueue(ref);
+    }
+
     while (queue.length) {
       const batch = queue.splice(0, 8);
       const results = await Promise.all(batch.map(async (internalPath) => {
@@ -225,8 +234,12 @@
       let m;
       const ITEMREF = /<itemref[^>]*\bidref\s*=\s*["']([^"']+)["']/gi;
       const idToHref = new Map();
-      const ITEM = /<item[^>]*\bid\s*=\s*["']([^"']+)["'][^>]*\bhref\s*=\s*["']([^"']+)["']/gi;
-      while ((m = ITEM.exec(text))) idToHref.set(m[1], m[2]);
+      // read id and href separately; they can appear in either order
+      for (const tag of text.match(/<item\b[^>]*>/gi) || []) {
+        const id = tag.match(/\bid\s*=\s*["']([^"']+)["']/i);
+        const href = tag.match(/\bhref\s*=\s*["']([^"']+)["']/i);
+        if (id && href) idToHref.set(id[1], href[1]);
+      }
       while ((m = ITEMREF.exec(text))) {
         const href = idToHref.get(m[1]);
         const internal = href && resolveInternal("package.opf", href);
@@ -246,13 +259,24 @@
       if (internal && blobUrls.has(internal)) return blobUrls.get(internal);
       return ref;
     };
-    let html = text.replace(REF_ATTR, (whole, ref) => {
-      const rewritten = rewrite(ref);
-      return whole.replace(ref, rewritten);
-    });
-    html = html.replace(CSS_URL, (whole, ref) => whole.replace(ref, rewrite(ref)));
+    // swap only the value part, so a ref like "s" can't hit the "s" in "src="
+    const swapValue = (whole, ref, value) => {
+      const at = whole.lastIndexOf(ref);
+      return at < 0 ? whole : whole.slice(0, at) + value + whole.slice(at + ref.length);
+    };
+    let html = text.replace(REF_ATTR, (whole, ref) => swapValue(whole, ref, rewrite(ref)));
+    html = html.replace(CSS_URL, (whole, ref) => swapValue(whole, ref, rewrite(ref)));
+    // the print doc is parsed as HTML, where XHTML <a id="p5"/> or <span/>
+    // would stay open and swallow the rest of the chapter
+    html = html.replace(/<([a-zA-Z][\w:-]*)(\s[^<>]*?)?\s*\/>/g, (whole, tag, attrs) =>
+      VOID_TAGS.has(tag.toLowerCase()) ? whole : `<${tag}${attrs || ""}></${tag}>`);
     return html;
   }
+
+  const VOID_TAGS = new Set([
+    "area", "base", "br", "col", "embed", "hr", "img", "input",
+    "link", "meta", "source", "track", "wbr"
+  ]);
 
   function extractBody(html) {
     const m = html.match(/<body[^>]*>([\s\S]*)<\/body>/i);
@@ -303,17 +327,10 @@
       for (const path of order) {
         const html = chapterHtml(path, decodeText(files.get(path)), blobUrls);
         const head = extractHead(html);
-        // Collect <style> and rewrite+inline <link rel=stylesheet> as <style>.
+        // Collect <style> blocks. Linked stylesheets are already inlined
+        // below (cssParts) with their url()s rewritten, so they're skipped here.
         const styleMatches = head.match(/<style[^>]*>[\s\S]*?<\/style>/gi) || [];
         collectedCss.push(...styleMatches);
-        const linkMatches = head.match(/<link[^>]*rel=["']?stylesheet["']?[^>]*>/gi) || [];
-        for (const linkTag of linkMatches) {
-          const hrefMatch = linkTag.match(/href\s*=\s*["']([^"']+)["']/i);
-          const internal = hrefMatch && resolveInternal(path, hrefMatch[1]);
-          if (internal && blobUrls.has(internal)) {
-            collectedCss.push(`<style>@import url("${blobUrls.get(internal)}");</style>`);
-          }
-        }
         parts.push(extractBody(html));
       }
 

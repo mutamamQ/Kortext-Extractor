@@ -4,8 +4,8 @@
   /*
    * Kortext personal-backup helper (v4).
    *
-   * Paste into DevTools console on the reader page, then reload the page so
-   * the hooks are active while you read (this captures chapters you visit).
+   * Paste into DevTools console on the reader page (don't reload — that
+   * clears the script), then read a page or two so a chapter is captured.
    * Call window.__ktxExport() whenever you like — the export itself will
    * HARVEST the rest of the book directly from the content API:
    *
@@ -116,36 +116,18 @@
         const sameOrigin = quietly(() => new URL(url, location.href).origin === location.origin) || false;
         const trackable = sameOrigin && String(method).toUpperCase() === "GET" && !isNoise(url);
 
-        let response;
-        response = await originalFetch.apply(this, args);
+        const response = await originalFetch.apply(this, args);
 
         if (!trackable || !response || !response.ok || !response.body) return response;
+        // read a clone so the reader always gets the untouched original response
         try {
-          const bytes = copyBytes(await response.arrayBuffer());
-          if (!bytes || !bytes.byteLength) return response;
-          const type = quietly(() => response.headers.get("content-type")) || "";
-          rememberNetwork(url, bytes, type, `fetch/${label}`);
-
-          const headers = new win.Headers(response.headers);
-          headers.delete("content-encoding");
-          headers.delete("content-length");
-          const replay = new win.Response(bytes.slice(0), {
-            status: response.status,
-            statusText: response.statusText,
-            headers
-          });
-          Object.defineProperty(replay, "url", { value: url, configurable: true });
-          return replay;
-        } catch (_) {
-          try {
-            return new win.Response(new Uint8Array(0), {
-              status: response.status,
-              statusText: response.statusText
-            });
-          } catch (_) {
-            return response;
+          const bytes = copyBytes(await response.clone().arrayBuffer());
+          if (bytes && bytes.byteLength) {
+            const type = quietly(() => response.headers.get("content-type")) || "";
+            rememberNetwork(url, bytes, type, `fetch/${label}`);
           }
-        }
+        } catch (_) {}
+        return response;
       };
       wrapped.__ktxHooked = true;
       win.fetch = wrapped;
@@ -208,7 +190,9 @@
   function resolveInternal(fromPath, ref) {
     ref = String(ref || "").trim();
     if (!ref || /^(https?:|data:|blob:|mailto:|tel:|#)/i.test(ref)) return null;
-    const refPath = ref.split("#")[0].split("?")[0];
+    const rawPath = ref.split("#")[0].split("?")[0];
+    // captured paths are stored decoded, so decode refs like my%20file.xhtml too
+    const refPath = quietly(() => decodeURIComponent(rawPath)) || rawPath;
     if (!refPath) return null;
     const stack = fromPath.split("/");
     stack.pop(); // drop filename -> directory of the referencing file
@@ -390,12 +374,13 @@
   function collectRefs(path, text) {
     const refs = [];
     let m;
-    REF_ATTR.lastValue = 0;
+    REF_ATTR.lastIndex = 0;
     while ((m = REF_ATTR.exec(text))) {
       const internal = resolveInternal(path, m[1]);
       if (internal) refs.push(internal);
     }
     if (/\.css$/i.test(path)) {
+      CSS_URL.lastIndex = 0;
       while ((m = CSS_URL.exec(text))) {
         const internal = resolveInternal(path, m[1]);
         if (internal) refs.push(internal);
@@ -459,6 +444,13 @@
       }
     }
 
+    // Captured chapters are already in `files`, so enqueue() skips them; follow
+    // their references here or nothing gets crawled when there is no package.opf.
+    for (const file of Array.from(files.values())) {
+      if (!/\.(xhtml|html|htm|css|opf|ncx|svg)$/i.test(file.path)) continue;
+      for (const ref of collectRefs(file.path, decodeText(file.bytes))) enqueue(ref);
+    }
+
     // 2) Crawl: process queue of internal paths, fetching missing ones and
     //    following references recursively (images, css, fonts, chapters, TOC).
     while (queue.length) {
@@ -466,10 +458,7 @@
       const results = await Promise.all(batch.map(async (internalPath) => {
         if (files.has(internalPath)) return files.get(internalPath);
         const bytes = await fetchResource(base + internalPath.split("/").map(encodeURIComponent).join("/"));
-        if (!bytes) {
-          quietly(() => queued.delete(internalPath));
-          return null;
-        }
+        if (!bytes) return null; // stays in `queued` so a 404 isn't retried for every page that links it
         fetchedCount += 1;
         store(internalPath, bytes);
         return files.get(internalPath);
@@ -546,17 +535,11 @@ ${spine.join("\n")}
     }
     exporting = true;
     try {
-      const base = contentBase();
-      if (!base) {
-        log("no content API requests captured yet — open/read at least one page, then export again");
-        return null;
-      }
-      log("content base:", base);
-
       const all = Array.from(capture.values())
         .filter((entry) => entry && entry.bytes && entry.bytes.byteLength);
 
       // PDF books: a single PDF resource in captures -> direct download.
+      // Checked before contentBase(), which only matches EPUB URLs.
       const pdfs = all.filter((entry) => startsWithPdf(entry.bytes));
       if (pdfs.length === 1 && !all.some((entry) => /\/EPUB\//.test(entry.url))) {
         const blob = new Blob([pdfs[0].bytes], { type: "application/pdf" });
@@ -564,6 +547,13 @@ ${spine.join("\n")}
         log("exported one complete PDF", `(${pdfs[0].bytes.byteLength} bytes)`);
         return blob;
       }
+
+      const base = contentBase();
+      if (!base) {
+        log("no content API requests captured yet — open/read at least one page, then export again");
+        return null;
+      }
+      log("content base:", base);
 
       const files = await harvest(base);
       if (!files.size) {
@@ -650,19 +640,32 @@ ${spine.join("\n")}
     return false;
   }
 
+  let walking = false;
   window.__ktxStartWalk = async function ktxStartWalk() {
+    if (walking) {
+      log("walker already running");
+      return;
+    }
+    walking = true;
+    window.__ktxWalk = true; // so calling this after __ktxWalk = false restarts it
     const maxSteps = 6000;
     const stepDelay = 800;
+    let misses = 0;
     log("walker started (pre-caching pages; export works without it)");
-    for (let step = 0; step < maxSteps && window.__ktxWalk; step += 1) {
-      advanceReader();
-      await new Promise((resolve) => setTimeout(resolve, stepDelay));
+    try {
+      for (let step = 0; step < maxSteps && window.__ktxWalk; step += 1) {
+        misses = advanceReader() ? 0 : misses + 1;
+        if (misses >= 15) break; // no next button for ~12s: end of book
+        await new Promise((resolve) => setTimeout(resolve, stepDelay));
+      }
+    } finally {
+      walking = false;
     }
     log("walker finished");
   };
 
   log("ready (v4, export-time harvest); window.__ktxExport() / __ktxStatus() / __ktxStartWalk()");
-  log("usage: paste, reload, read a page or two, then call __ktxExport() — it fetches the rest of the book itself");
+  log("usage: read a page or two (don't reload), then call __ktxExport() — it fetches the rest of the book itself");
   if (window.__ktxWalk) {
     setTimeout(() => window.__ktxStartWalk(), 1500);
   }
