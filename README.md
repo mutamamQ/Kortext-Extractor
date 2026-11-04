@@ -12,14 +12,14 @@ Browser console scripts for saving a personal backup of a book you have access t
 1. Open the book in the Kortext reader.
 2. Open DevTools (F12) and go to the Console tab.
 3. Paste the contents of `kortext-extract.js` and press Enter.
-4. Turn a page or two. You should see `[ktx] captured ...` lines in the console.
+4. Turn a page or two. This lets the script pick up the reader's login headers; without them chapters fail to download (the export warns you if it hasn't seen them yet).
 5. Run:
 
    ```js
    await __ktxExport()
    ```
 
-   It fetches the rest of the book and downloads `<title>.epub`.
+   It fetches the whole book (about 15s for a 2000-file textbook) and downloads `<title>.epub` to your Downloads folder.
 
 ## PDF
 
@@ -46,4 +46,5 @@ Browser console scripts for saving a personal backup of a book you have access t
 - About 1.5s after pasting, the script starts turning pages by itself. The export doesn't need this, so turn it off with `__ktxWalk = false` if it gets in the way.
 - Don't reload the page after pasting. A reload clears the script and you'll have to paste it again.
 - If the book is a single PDF on Kortext's side, `__ktxExport()` downloads that PDF directly.
+- If the print dialog doesn't appear, the assembled book is still available: open `__ktxPdfDocUrl` in a new tab and print from there.
 - Only use this on books you have legitimate access to, for your own use.

@@ -319,6 +319,9 @@
         log("no content API requests captured yet — read at least one page first");
         return null;
       }
+      if (!(window.__ktxAuthHeaders && window.__ktxAuthHeaders.authorization)) {
+        log("warning: no reader auth headers seen yet — turn a page first or chapters may 401");
+      }
 
       const files = await harvest(base);
       if (!files.size) {
